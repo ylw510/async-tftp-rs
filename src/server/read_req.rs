@@ -162,46 +162,82 @@ where
         }
     }
 
-    /// Sends packets contained in a window and waits for client to acknowledge them. Returns amount
-    /// of packets acknowledged.
+    /// Sends packets contained in a window and waits until they are all
+    /// acknowledged. Returns the number of packets acknowledged (always the
+    /// full window length on success).
+    ///
+    /// Per RFC 7440 §4, on timeout the transfer resumes from the last received
+    /// ACK: only the unacked suffix is retransmitted, not the entire window.
     async fn send_window(
         &mut self,
         window: &VecDeque<Bytes>,
         window_base: u16,
     ) -> Result<u16> {
-        // Send packet until we receive an ack
-        for _ in 0..=self.max_send_retries {
-            for packet in window {
+        let window_len = window.len() as u16;
+        if window_len == 0 {
+            return Ok(0);
+        }
+
+        // How many leading blocks of `window` are already ACKed (relative to
+        // `window_base`). Timeout retransmits only `window[acked..]`.
+        let mut acked: u16 = 0;
+        let mut timeout_retries: u32 = 0;
+
+        loop {
+            let offset = usize::from(acked);
+            for packet in window.iter().skip(offset) {
                 self.socket.send_to(&packet[..], self.peer).await?;
             }
 
-            match self.recv_ack(window_base, window.len() as u16).await {
-                Ok(blocks_acked) => {
+            let remaining = window_len - acked;
+            let ack_base = window_base.wrapping_add(acked);
+
+            match self.recv_ack(ack_base, remaining).await {
+                Ok(n) => {
+                    // `n` is relative to the remaining suffix starting at `ack_base`.
+                    if n == 0 {
+                        continue;
+                    }
+                    acked = acked.saturating_add(n).min(window_len);
                     trace!(
                         "RRQ (peer: {}, window_base: {}, blocks_acked: {}, window_len: {}) - Received ACK",
                         &self.peer,
                         window_base,
-                        blocks_acked,
-                        window.len()
+                        acked,
+                        window_len
                     );
-                    return Ok(blocks_acked);
+                    if acked == window_len {
+                        return Ok(acked);
+                    }
+                    // Partial ACK (RFC 7440 out-of-sequence recovery): send the
+                    // remaining suffix and reset the timeout retry counter.
+                    timeout_retries = 0;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
                     trace!(
                         "RRQ (peer: {}, block_id: {}) - Timeout",
                         &self.peer,
-                        window_base
+                        ack_base
                     );
-                    continue;
+                    if timeout_retries >= self.max_send_retries {
+                        return Err(Error::MaxSendRetriesReached(
+                            self.peer, ack_base,
+                        ));
+                    }
+                    timeout_retries += 1;
+                    // Retransmit unacked suffix only on the next loop iteration.
                 }
                 Err(e) => return Err(e.into()),
             }
         }
-
-        Err(Error::MaxSendRetriesReached(self.peer, window_base))
     }
 
-    /// Waits for ack packet, returns amount of packets acknowledged.
+    /// Waits for an ACK covering blocks in
+    /// `[window_base, window_base.wrapping_add(window_len))`.
+    ///
+    /// Returns how many blocks from `window_base` were acknowledged (1..=window_len).
+    /// `window_base` / `window_len` describe the current unacked suffix when
+    /// called from [`send_window`].
     async fn recv_ack(
         &mut self,
         window_base: u16,
@@ -231,19 +267,23 @@ where
 
                     if window_end > window_base {
                         // window_end did not wrap
-                        if recved_block_id >= window_base && recved_block_id < window_end {
-                            // number of blocks acked
-                            return Ok(recved_block_id-window_base+1u16);
-                        }
-                        else {
+                        if recved_block_id >= window_base
+                            && recved_block_id < window_end
+                        {
+                            // number of blocks acked relative to window_base
+                            return Ok(recved_block_id - window_base + 1u16);
+                        } else {
                             trace!("Unexpected ack packet {recved_block_id}, window_base: {window_base}, window_len: {window_len}");
                         }
-                    }else {
+                    } else {
                         // window_end wrapped
                         if recved_block_id >= window_base {
                             return Ok(1u16 + (recved_block_id - window_base));
                         } else if recved_block_id < window_end {
-                            return Ok(1u16 + recved_block_id + (window_len - window_end));
+                            return Ok(
+                                1u16 + recved_block_id
+                                    + (window_len - window_end),
+                            );
                         } else {
                             trace!("Unexpected ack packet {recved_block_id}, window_base: {window_base}, window_len: {window_len}");
                         }
