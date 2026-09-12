@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [unreleased]
 
+### Added
+
+- write_req: Negotiate and honour RFC 7440 `windowsize` on WRQ uploads
+  (ACK once per window, matching RRQ behaviour)
+
 ## [0.4.2] - 2025-12-02
 
 ### Added
