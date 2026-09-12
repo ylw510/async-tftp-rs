@@ -253,6 +253,7 @@ impl From<crate::Error> for Error {
     fn from(err: crate::Error) -> Self {
         match err {
             crate::Error::Packet(e) => e,
+            crate::Error::ClientAborted(e) => e,
             crate::Error::Io(e) => e.into(),
             crate::Error::InvalidPacket => Error::IllegalOperation,
             crate::Error::MaxSendRetriesReached(..) => {

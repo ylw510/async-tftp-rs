@@ -73,14 +73,25 @@ where
     }
 
     pub(crate) async fn handle(&mut self) {
-        if let Err(e) = self.try_handle().await {
-            trace!("WRQ request failed (peer: {}, error: {}", self.peer, &e);
+        match self.try_handle().await {
+            Ok(()) => {}
+            // Peer already terminated (RFC 1350 / 2347); do not send ERROR back.
+            Err(Error::ClientAborted(ref e)) => {
+                trace!(
+                    "WRQ peer aborted transfer (peer: {}, error: {:?})",
+                    self.peer,
+                    e
+                );
+            }
+            Err(e) => {
+                trace!("WRQ request failed (peer: {}, error: {}", self.peer, &e);
 
-            Packet::Error(e.into()).encode(&mut self.buffer);
-            let buf = self.buffer.split().freeze();
-            // Errors are never retransmitted.
-            // We do not care if `send_to` resulted to an IO error.
-            let _ = self.socket.send_to(&buf[..], self.peer).await;
+                Packet::Error(e.into()).encode(&mut self.buffer);
+                let buf = self.buffer.split().freeze();
+                // Errors are never retransmitted.
+                // We do not care if `send_to` resulted to an IO error.
+                let _ = self.socket.send_to(&buf[..], self.peer).await;
+            }
         }
     }
 
@@ -125,26 +136,31 @@ where
                     self.socket.send_to(&self.ack, self.peer).await?;
                     return Ok(data);
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
+                Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::TimedOut => {
                     // On timeout reply with the previous ACK packet
                     self.socket.send_to(&self.ack, self.peer).await?;
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
 
         Err(Error::MaxSendRetriesReached(self.peer, block_id))
     }
 
-    async fn recv_data_block(&mut self, block_id: u16) -> io::Result<Bytes> {
+    async fn recv_data_block(&mut self, block_id: u16) -> Result<Bytes> {
         let socket = &mut self.socket;
         let peer = self.peer;
 
         self.buffer.resize(PACKET_DATA_HEADER_LEN + self.block_size, 0);
         let mut buf = self.buffer.split();
 
-        io_timeout(self.timeout, async move {
+        enum DataWait {
+            Data(Bytes),
+            Aborted(crate::packet::Error),
+        }
+
+        let outcome = io_timeout(self.timeout, async move {
             loop {
                 let (len, recved_peer) = socket.recv_from(&mut buf[..]).await?;
 
@@ -152,20 +168,28 @@ where
                     continue;
                 }
 
-                if let Ok(Packet::Data(recved_block_id, _)) =
-                    Packet::decode(&buf[..len])
-                {
-                    if recved_block_id == block_id {
-                        buf.truncate(len);
-                        buf.advance(PACKET_DATA_HEADER_LEN);
-                        break;
+                match Packet::decode(&buf[..len]) {
+                    Ok(Packet::Data(recved_block_id, _)) => {
+                        if recved_block_id == block_id {
+                            buf.truncate(len);
+                            buf.advance(PACKET_DATA_HEADER_LEN);
+                            return Ok(DataWait::Data(buf.freeze()));
+                        }
                     }
+                    // RFC 1350: ERROR terminates the transfer.
+                    Ok(Packet::Error(err)) => {
+                        return Ok(DataWait::Aborted(err));
+                    }
+                    _ => {}
                 }
             }
-
-            Ok(buf.freeze())
         })
-        .await
+        .await?;
+
+        match outcome {
+            DataWait::Data(data) => Ok(data),
+            DataWait::Aborted(err) => Err(Error::ClientAborted(err)),
+        }
     }
 }
 

@@ -75,14 +75,25 @@ where
     }
 
     pub(crate) async fn handle(&mut self) {
-        if let Err(e) = self.try_handle().await {
-            trace!("RRQ request failed (peer: {}, error: {})", &self.peer, &e);
-            let mut buffer = BytesMut::with_capacity(DEFAULT_BLOCK_SIZE);
-            Packet::Error(e.into()).encode(&mut buffer);
-            let buf = buffer.split().freeze();
-            // Errors are never retransmitted.
-            // We do not care if `send_to` resulted to an IO error.
-            let _ = self.socket.send_to(&buf[..], self.peer).await;
+        match self.try_handle().await {
+            Ok(()) => {}
+            // Peer already terminated (RFC 1350 / 2347); do not send ERROR back.
+            Err(Error::ClientAborted(ref e)) => {
+                trace!(
+                    "RRQ peer aborted transfer (peer: {}, error: {:?})",
+                    &self.peer,
+                    e
+                );
+            }
+            Err(e) => {
+                trace!("RRQ request failed (peer: {}, error: {})", &self.peer, &e);
+                let mut buffer = BytesMut::with_capacity(DEFAULT_BLOCK_SIZE);
+                Packet::Error(e.into()).encode(&mut buffer);
+                let buf = buffer.split().freeze();
+                // Errors are never retransmitted.
+                // We do not care if `send_to` resulted to an IO error.
+                let _ = self.socket.send_to(&buf[..], self.peer).await;
+            }
         }
     }
 
@@ -186,7 +197,7 @@ where
                     );
                     return Ok(blocks_acked);
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => {
+                Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::TimedOut => {
                     trace!(
                         "RRQ (peer: {}, block_id: {}) - Timeout",
                         &self.peer,
@@ -194,7 +205,7 @@ where
                     );
                     continue;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             }
         }
 
@@ -202,17 +213,25 @@ where
     }
 
     /// Waits for ack packet, returns amount of packets acknowledged.
+    ///
+    /// A peer TFTP ERROR (e.g. OACK rejection with code 8) aborts the wait
+    /// with [`Error::ClientAborted`] instead of being ignored.
     async fn recv_ack(
         &mut self,
         window_base: u16,
         window_len: u16,
-    ) -> io::Result<u16> {
+    ) -> Result<u16> {
         // We can not use `self` within `async_std::io::timeout` because not all
         // struct members implement `Sync`. So we borrow only what we need.
         let socket = &mut self.socket;
         let peer = self.peer;
 
-        io_timeout(self.timeout, async {
+        enum AckWait {
+            Acked(u16),
+            Aborted(crate::packet::Error),
+        }
+
+        let outcome = io_timeout(self.timeout, async {
             let mut buf = [0u8; 1024];
 
             loop {
@@ -223,35 +242,53 @@ where
                     continue;
                 }
 
-                // parse only valid Ack packets, the rest are ignored
-                if let Ok(Packet::Ack(recved_block_id)) =
-                    Packet::decode(&buf[..len])
-                {
-                    let window_end = window_base.wrapping_add(window_len);
+                match Packet::decode(&buf[..len]) {
+                    Ok(Packet::Ack(recved_block_id)) => {
+                        let window_end = window_base.wrapping_add(window_len);
 
-                    if window_end > window_base {
-                        // window_end did not wrap
-                        if recved_block_id >= window_base && recved_block_id < window_end {
-                            // number of blocks acked
-                            return Ok(recved_block_id-window_base+1u16);
-                        }
-                        else {
-                            trace!("Unexpected ack packet {recved_block_id}, window_base: {window_base}, window_len: {window_len}");
-                        }
-                    }else {
-                        // window_end wrapped
-                        if recved_block_id >= window_base {
-                            return Ok(1u16 + (recved_block_id - window_base));
-                        } else if recved_block_id < window_end {
-                            return Ok(1u16 + recved_block_id + (window_len - window_end));
+                        if window_end > window_base {
+                            // window_end did not wrap
+                            if recved_block_id >= window_base
+                                && recved_block_id < window_end
+                            {
+                                // number of blocks acked
+                                return Ok(AckWait::Acked(
+                                    recved_block_id - window_base + 1u16,
+                                ));
+                            } else {
+                                trace!("Unexpected ack packet {recved_block_id}, window_base: {window_base}, window_len: {window_len}");
+                            }
                         } else {
-                            trace!("Unexpected ack packet {recved_block_id}, window_base: {window_base}, window_len: {window_len}");
+                            // window_end wrapped
+                            if recved_block_id >= window_base {
+                                return Ok(AckWait::Acked(
+                                    1u16 + (recved_block_id - window_base),
+                                ));
+                            } else if recved_block_id < window_end {
+                                return Ok(AckWait::Acked(
+                                    1u16 + recved_block_id
+                                        + (window_len - window_end),
+                                ));
+                            } else {
+                                trace!("Unexpected ack packet {recved_block_id}, window_base: {window_base}, window_len: {window_len}");
+                            }
                         }
                     }
+                    // RFC 2347/2348: client may reject OACK with ERROR code 8.
+                    // RFC 1350: ERROR terminates the transfer.
+                    Ok(Packet::Error(err)) => {
+                        return Ok(AckWait::Aborted(err));
+                    }
+                    _ => {}
                 }
             }
         })
-        .await
+        .await?;
+
+        match outcome {
+            AckWait::Acked(n) => Ok(n),
+            AckWait::Aborted(err) => Err(Error::ClientAborted(err)),
+        }
     }
 
     async fn read_block(&mut self, buf: &mut [u8]) -> Result<usize> {
